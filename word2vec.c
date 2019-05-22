@@ -29,7 +29,7 @@ const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vo
 typedef float real;                    // Precision of float numbers
 
 struct vocab_word {
-  long long cn;
+  long long cn; //count:一个词出现的次数
   int *point;
   char *word, *code, codelen;
 };
@@ -39,7 +39,7 @@ char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
 struct vocab_word *vocab;
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
 int *vocab_hash;
-long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
+long long vocab_max_size = 1000/*如果运行中不够可以再增加*/, vocab_size = 0, layer1_size = 100;
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn0, *syn1, *syn1neg, *expTable;
@@ -119,20 +119,31 @@ int ReadWordIndex(FILE *fin) {
 
 // Adds a word to the vocabulary
 int AddWordToVocab(char *word) {
+  //printf("AddWordToVocab input: %s\n", word);
   unsigned int hash, length = strlen(word) + 1;
-  if (length > MAX_STRING) length = MAX_STRING;
+  if (length > MAX_STRING) length = MAX_STRING;//词长度有限制
   vocab[vocab_size].word = (char *)calloc(length, sizeof(char));
   strcpy(vocab[vocab_size].word, word);
   vocab[vocab_size].cn = 0;
   vocab_size++;
   // Reallocate memory if needed
-  if (vocab_size + 2 >= vocab_max_size) {
+  if (vocab_size + 2 >= vocab_max_size) { 
     vocab_max_size += 1000;
     vocab = (struct vocab_word *)realloc(vocab, vocab_max_size * sizeof(struct vocab_word));
   }
-  hash = GetWordHash(word);
+  hash = GetWordHash(word); //hash成Int值--用做下标
+  //解除碰撞
   while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
-  vocab_hash[hash] = vocab_size - 1;
+  vocab_hash[hash] = vocab_size - 1;//word->hash->vocab_size(自增)
+
+  /*
+  word osama, hash 12727569, vocab[hash] 22243
+  word terrorist, hash 6075502, vocab[hash] 22244
+  word interim, hash 5936504, vocab[hash] 22248
+  word aia, hash 6433835, vocab[hash] 22249
+
+  printf("word %s, hash %d, vocab[hash] %d\n", word, hash, vocab_size-1);
+  */
   return vocab_size - 1;
 }
 
@@ -160,7 +171,7 @@ void SortVocab() {
       hash=GetWordHash(vocab[a].word);
       while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
       vocab_hash[hash] = a;
-      train_words += vocab[a].cn;
+      train_words += vocab[a].cn; //统计总训练词数，一个词出现多次则计算多次
     }
   }
   vocab = (struct vocab_word *)realloc(vocab, (vocab_size + 1) * sizeof(struct vocab_word));
@@ -259,6 +270,9 @@ void CreateBinaryTree() {
   free(parent_node);
 }
 
+// 过一遍所有词，构建vocab和vocab_hash, 删除稀有词, 按词频降序
+// vocab中保存的word
+// vocab_hash把word进行Hash并从0开始编号, vocab_hash[hash]=(vocab_size++)-1
 void LearnVocabFromTrainFile() {
   char word[MAX_STRING];
   FILE *fin;
@@ -270,7 +284,7 @@ void LearnVocabFromTrainFile() {
     exit(1);
   }
   vocab_size = 0;
-  AddWordToVocab((char *)"</s>");
+  AddWordToVocab((char *)"</s>"); //输入是word
   while (1) {
     ReadWord(word, fin);
     if (feof(fin)) break;
@@ -279,14 +293,14 @@ void LearnVocabFromTrainFile() {
       printf("%lldK%c", train_words / 1000, 13);
       fflush(stdout);
     }
-    i = SearchVocab(word);
-    if (i == -1) {
+    i = SearchVocab(word); //通过word查找vocab_hash[hash]
+    if (i == -1) { //查找失败,则加入:方法为vocab_hash[hash(word)]=vocab_hash.size++
       a = AddWordToVocab(word);
       vocab[a].cn = 1;
     } else vocab[i].cn++;
-    if (vocab_size > vocab_hash_size * 0.7) ReduceVocab();
+    if (vocab_size > vocab_hash_size * 0.7) ReduceVocab(); //删除稀有词
   }
-  SortVocab();
+  SortVocab(); //按词频排序
   if (debug_mode > 0) {
     printf("Vocab size: %lld\n", vocab_size);
     printf("Words in train file: %lld\n", train_words);
@@ -340,21 +354,26 @@ void InitNet() {
   unsigned long long next_random = 1;
   a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
   if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
-  if (hs) {
+  if (hs) { //int值: 运行时传入 Use Hierarchical Softmax; default is 0 (not used)
+    //生成映射层即输出层的权重
     a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
     for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
      syn1[a * layer1_size + b] = 0;
   }
-  if (negative>0) {
+  if (negative>0) {//int值: 运行时传入  Number of negative examples; default is 5, common values are 3 - 10 (0 = not used)
+    //随机负采样, 在预测结果为词w时,词w为正样本,可以从全词中随机选一些词做为负样本.
     a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
     for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
      syn1neg[a * layer1_size + b] = 0;
   }
-  for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++) {
-    next_random = next_random * (unsigned long long)25214903917 + 11;
-    syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
+  for (a = 0; a < vocab_size; a++) {//vocab_size:词个数
+      for (b = 0; b < layer1_size; b++) {//layer1_size: 100
+      next_random = next_random * (unsigned long long)25214903917 + 11;
+      //词向量的初始化: 每个词要生成layer1_size个随机数
+      syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size; //生成一个float随机数
+    }
   }
   CreateBinaryTree();
 }
@@ -546,10 +565,14 @@ void TrainModel() {
   FILE *fo;
   pthread_t *pt = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
   printf("Starting training using file %s\n", train_file);
-  starting_alpha = alpha;
+  starting_alpha = alpha; //float
   if (read_vocab_file[0] != 0) ReadVocab(); else LearnVocabFromTrainFile();
-  if (save_vocab_file[0] != 0) SaveVocab();
-  if (output_file[0] == 0) return;
+  if (save_vocab_file[0] != 0) {
+    SaveVocab(); //保存word-count
+    printf("%s in \t %s\n", "SaveVocab", save_vocab_file);
+  }
+  if (output_file[0] == 0) return; // output_file: -output
+  //网络初始化了什么: 包括权重初始华和Huffman树的建立
   InitNet();
   if (negative > 0) InitUnigramTable();
   start = clock();
@@ -690,8 +713,11 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);
+  printf("vocab_max_size: %d\tvocab_hash_size:%d\tEXP_TABLE_SIZE:%d\n", 
+      vocab_max_size, vocab_hash_size, EXP_TABLE_SIZE);
   vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
   vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
+  //expTable: float Table
   expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
   for (i = 0; i < EXP_TABLE_SIZE; i++) {
     expTable[i] = exp((i / (real)EXP_TABLE_SIZE * 2 - 1) * MAX_EXP); // Precompute the exp() table
